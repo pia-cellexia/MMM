@@ -176,18 +176,56 @@ def select_lambda(
 # 4. Budget ↔ spend mapping
 # ---------------------------------------------------------------------------
 
-def fit_budget_model(df: pd.DataFrame) -> tuple[float, float]:
-    """Linear regression: cost = θ₀ + θ₁ · ad_budget. Returns (θ₀, θ₁)."""
+def fit_budget_model(df: pd.DataFrame) -> dict:
+    """
+    Linear regression: cost = θ₀ + θ₁ · ad_budget, plus historical
+    budget bounds and fill-rate (cost/ad_budget) percentiles.
+    """
     model = LinearRegression()
     model.fit(df[["ad_budget"]].values, df["cost"].values)
-    return float(model.intercept_), float(model.coef_[0])
+
+    fill_rate = df["cost"] / df["ad_budget"]
+
+    return {
+        "theta0": float(model.intercept_),
+        "theta1": float(model.coef_[0]),
+        "min_budget": float(df["ad_budget"].min()),
+        "max_budget": float(df["ad_budget"].max()),
+        "median_fill": float(fill_rate.median()),
+        "p10_fill": float(fill_rate.quantile(0.10)),
+        "p90_fill": float(fill_rate.quantile(0.90)),
+    }
 
 
-def spend_to_budget(desired_spend: float, theta0: float, theta1: float) -> float:
-    """Invert the linear cost–budget relationship."""
+def spend_to_budget(
+    desired_spend: float,
+    theta0: float,
+    theta1: float,
+    min_budget: float,
+    max_budget: float,
+    p10_fill: float,
+    p90_fill: float,
+    **_kwargs,
+) -> float:
+    """
+    Invert the linear cost–budget relationship, then enforce:
+      1. Fill-rate (spend/budget) stays within [p10, p90] of historical data.
+      2. Budget is clamped to [min_budget, max_budget] observed historically.
+    """
     if theta1 == 0:
         return 0.0
-    return max(0.0, (desired_spend - theta0) / theta1)
+
+    budget = (desired_spend - theta0) / theta1
+
+    # Enforce historical fill-rate band
+    if budget > 0:
+        implied_fill = desired_spend / budget
+        if implied_fill < p10_fill:
+            budget = desired_spend / p10_fill
+        elif implied_fill > p90_fill:
+            budget = desired_spend / p90_fill
+
+    return float(np.clip(budget, min_budget, max_budget))
 
 
 # ---------------------------------------------------------------------------
@@ -207,15 +245,17 @@ def predict_conversions(
     lam: float,
     model: Ridge,
     feature_cols: list[str],
-    theta0: float,
-    theta1: float,
+    budget_params: dict,
     typical_dow: dict[str, float],
     typical_t: float,
 ) -> float:
     """Predict daily conversions for a constant daily spend (steady state)."""
-    adstock_ss = steady_state_adstock(spend, lam)
+    if lam == 0:
+        adstock_ss = spend
+    else:
+        adstock_ss = steady_state_adstock(spend, lam)
     log_adstock = np.log(adstock_ss + 1.0)
-    budget = spend_to_budget(spend, theta0, theta1)
+    budget = spend_to_budget(spend, **budget_params)
 
     feat = {"log_adstock": log_adstock, "ad_budget": budget, "t": typical_t}
     feat.update(typical_dow)
@@ -271,8 +311,7 @@ def find_optimal_spend(
     lam: float,
     model: Ridge,
     feature_cols: list[str],
-    theta0: float,
-    theta1: float,
+    budget_params: dict,
     grid_size: int = 200,
 ) -> pd.DataFrame:
     """
@@ -287,8 +326,7 @@ def find_optimal_spend(
         lam=lam,
         model=model,
         feature_cols=feature_cols,
-        theta0=theta0,
-        theta1=theta1,
+        budget_params=budget_params,
         typical_dow=typical_dow,
         typical_t=typical_t,
     )
@@ -300,7 +338,7 @@ def find_optimal_spend(
     for s in spend_grid:
         m = metrics_for_spend(s, aov, **predict_kwargs)
         m["marginal_roas"] = round(marginal_roas(s, aov, **predict_kwargs), 4)
-        m["budget"] = round(spend_to_budget(s, theta0, theta1), 2)
+        m["budget"] = round(spend_to_budget(s, **budget_params), 2)
         rows.append(m)
 
     res_df = pd.DataFrame(rows)
@@ -318,6 +356,7 @@ def run(
     target_mroas: float = 3.5,
     grid_size: int = 200,
     output_csv: str | None = "budget_response_curve.csv",
+    max_budget_cap: float | None = None,
 ) -> dict:
     """End-to-end pipeline: load → fit → optimise → report."""
 
@@ -336,8 +375,22 @@ def run(
     print(f"  {'intercept':>15s}: {model.intercept_:+.4f}\n")
 
     # --- Budget ↔ spend mapping ---
-    theta0, theta1 = fit_budget_model(df)
-    print(f"Budget→spend mapping: cost ≈ {theta0:.2f} + {theta1:.4f} × ad_budget\n")
+    budget_params = fit_budget_model(df)
+
+    # Apply user cap
+    if max_budget_cap is not None:
+        budget_params["max_budget"] = min(budget_params["max_budget"], max_budget_cap)
+
+    print(f"Budget→spend mapping: cost ≈ {budget_params['theta0']:.2f}"
+          f" + {budget_params['theta1']:.4f} × ad_budget")
+    print(f"Historical budget range : "
+          f"${budget_params['min_budget']:.2f} – ${budget_params['max_budget']:.2f}"
+          + (f"  (capped by --max-budget-cap {max_budget_cap})"
+             if max_budget_cap is not None else ""))
+    print(f"Historical fill rate    : "
+          f"median={budget_params['median_fill']:.2f}, "
+          f"p10={budget_params['p10_fill']:.2f}, "
+          f"p90={budget_params['p90_fill']:.2f}\n")
 
     # --- Prepare adstock on df for later use ---
     df["adstock"] = build_adstock(df["cost"], lam)
@@ -345,11 +398,14 @@ def run(
 
     # --- Grid search ---
     res_df = find_optimal_spend(
-        df, aov, target_mroas, lam, model, feature_cols, theta0, theta1,
+        df, aov, target_mroas, lam, model, feature_cols, budget_params,
         grid_size=grid_size,
     )
 
     optimal_row = res_df.loc[res_df["mroas_diff"].idxmin()]
+
+    implied_fill = (optimal_row["spend"] / optimal_row["budget"]
+                    if optimal_row["budget"] > 0 else float("nan"))
 
     print("=" * 60)
     print("OPTIMAL BUDGET RECOMMENDATION")
@@ -360,6 +416,7 @@ def run(
     print(f"  ---")
     print(f"  Optimal daily spend     : ${optimal_row['spend']:.2f}")
     print(f"  Suggested daily budget  : ${optimal_row['budget']:.2f}")
+    print(f"  Implied fill rate       : {implied_fill:.2f}")
     print(f"  Expected conversions    : {optimal_row['conversions']:.2f}")
     print(f"  Expected revenue        : ${optimal_row['revenue']:.2f}")
     print(f"  Expected ROAS           : {optimal_row['roas']:.2f}")
@@ -376,6 +433,7 @@ def run(
         "lam": lam,
         "optimal_spend": float(optimal_row["spend"]),
         "optimal_budget": float(optimal_row["budget"]),
+        "implied_fill_rate": float(implied_fill),
         "conversions": float(optimal_row["conversions"]),
         "revenue": float(optimal_row["revenue"]),
         "roas": float(optimal_row["roas"]),
@@ -383,8 +441,7 @@ def run(
         "profit": float(optimal_row["profit"]),
         "model": model,
         "feature_cols": feature_cols,
-        "theta0": theta0,
-        "theta1": theta1,
+        "budget_params": budget_params,
         "response_curve": res_df.drop(columns=["mroas_diff"]),
     }
 
@@ -404,6 +461,10 @@ def main():
     )
     parser.add_argument("--grid-size", type=int, default=200, help="Spend grid resolution")
     parser.add_argument("--output", default="budget_response_curve.csv", help="Output CSV")
+    parser.add_argument(
+        "--max-budget-cap", type=float, default=None,
+        help="Hard upper cap on suggested daily budget",
+    )
     args = parser.parse_args()
 
     run(
@@ -412,6 +473,7 @@ def main():
         target_mroas=args.target_mroas,
         grid_size=args.grid_size,
         output_csv=args.output,
+        max_budget_cap=args.max_budget_cap,
     )
 
 
