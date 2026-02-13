@@ -179,7 +179,7 @@ def select_lambda(
 def fit_budget_model(df: pd.DataFrame) -> dict:
     """
     Linear regression: cost = θ₀ + θ₁ · ad_budget, plus historical
-    budget bounds and fill-rate (cost/ad_budget) percentiles.
+    fill-rate (cost/ad_budget) percentiles for plausibility checks.
     """
     model = LinearRegression()
     model.fit(df[["ad_budget"]].values, df["cost"].values)
@@ -189,8 +189,6 @@ def fit_budget_model(df: pd.DataFrame) -> dict:
     return {
         "theta0": float(model.intercept_),
         "theta1": float(model.coef_[0]),
-        "min_budget": float(df["ad_budget"].min()),
-        "max_budget": float(df["ad_budget"].max()),
         "median_fill": float(fill_rate.median()),
         "p10_fill": float(fill_rate.quantile(0.10)),
         "p90_fill": float(fill_rate.quantile(0.90)),
@@ -201,16 +199,16 @@ def spend_to_budget(
     desired_spend: float,
     theta0: float,
     theta1: float,
-    min_budget: float,
-    max_budget: float,
     p10_fill: float,
     p90_fill: float,
+    max_budget_cap: float | None = None,
     **_kwargs,
 ) -> float:
     """
     Invert the linear cost–budget relationship, then enforce:
       1. Fill-rate (spend/budget) stays within [p10, p90] of historical data.
-      2. Budget is clamped to [min_budget, max_budget] observed historically.
+      2. Budget is non-negative.
+      3. If max_budget_cap is set, clamp to that user-supplied limit.
     """
     if theta1 == 0:
         return 0.0
@@ -225,7 +223,12 @@ def spend_to_budget(
         elif implied_fill > p90_fill:
             budget = desired_spend / p90_fill
 
-    return float(np.clip(budget, min_budget, max_budget))
+    budget = max(0.0, budget)
+
+    if max_budget_cap is not None:
+        budget = min(budget, max_budget_cap)
+
+    return float(budget)
 
 
 # ---------------------------------------------------------------------------
@@ -377,16 +380,18 @@ def run(
     # --- Budget ↔ spend mapping ---
     budget_params = fit_budget_model(df)
 
-    # Apply user cap
+    # Pass user cap into budget_params so spend_to_budget can enforce it
     if max_budget_cap is not None:
-        budget_params["max_budget"] = min(budget_params["max_budget"], max_budget_cap)
+        budget_params["max_budget_cap"] = max_budget_cap
 
     print(f"Budget→spend mapping: cost ≈ {budget_params['theta0']:.2f}"
           f" + {budget_params['theta1']:.4f} × ad_budget")
+    print(f"Historical spend range  : "
+          f"${df['cost'].min():.2f} – ${df['cost'].max():.2f}")
     print(f"Historical budget range : "
-          f"${budget_params['min_budget']:.2f} – ${budget_params['max_budget']:.2f}"
-          + (f"  (capped by --max-budget-cap {max_budget_cap})"
-             if max_budget_cap is not None else ""))
+          f"${df['ad_budget'].min():.2f} – ${df['ad_budget'].max():.2f}")
+    if max_budget_cap is not None:
+        print(f"User budget cap         : ${max_budget_cap:.2f}")
     print(f"Historical fill rate    : "
           f"median={budget_params['median_fill']:.2f}, "
           f"p10={budget_params['p10_fill']:.2f}, "
