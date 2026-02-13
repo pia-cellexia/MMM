@@ -27,8 +27,23 @@ from sklearn.metrics import mean_squared_error, r2_score
 # ---------------------------------------------------------------------------
 
 def load_data(path: str | Path) -> pd.DataFrame:
-    """Read the CSV and add time-trend and day-of-week features."""
-    df = pd.read_csv(path, parse_dates=["date"])
+    """Read CSV or Excel file and add time-trend and day-of-week features."""
+    path = Path(path)
+    if path.suffix in (".xlsx", ".xls"):
+        df = pd.read_excel(path)
+    else:
+        df = pd.read_csv(path)
+
+    df["date"] = pd.to_datetime(df["date"])
+
+    # Report and drop rows with NaN in required columns
+    required = ["date", "conversions", "cost", "ad_budget"]
+    n_before = len(df)
+    df = df.dropna(subset=required)
+    n_dropped = n_before - len(df)
+    if n_dropped:
+        print(f"Warning: dropped {n_dropped} rows with NaN in {required}")
+
     df = df.sort_values("date").reset_index(drop=True)
 
     # Time trend (integer index)
