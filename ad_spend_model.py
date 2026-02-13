@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression, Ridge
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_squared_error, r2_score
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +76,7 @@ def fit_response_model(
     lam: float,
     alpha: float = 1.0,
     validation_split: float = 0.2,
-) -> tuple[Ridge, list[str], float]:
+) -> tuple[Ridge, list[str], float, float, float]:
     """
     Fit Ridge regression: log(conversions+1) ~ log(adstock+1) + controls.
 
@@ -85,6 +85,8 @@ def fit_response_model(
     model : fitted Ridge
     feature_cols : ordered feature names
     val_rmse : validation RMSE (on held-out tail)
+    train_r2 : R² on the training set
+    val_r2 : R² on the validation set
     """
     df = df.copy()
     df["adstock"] = build_adstock(df["cost"], lam)
@@ -102,10 +104,14 @@ def fit_response_model(
     model = Ridge(alpha=alpha)
     model.fit(X_train, y_train)
 
-    y_pred = model.predict(X_val)
-    val_rmse = float(np.sqrt(mean_squared_error(y_val, y_pred)))
+    y_train_pred = model.predict(X_train)
+    y_val_pred = model.predict(X_val)
 
-    return model, feature_cols, val_rmse
+    val_rmse = float(np.sqrt(mean_squared_error(y_val, y_val_pred)))
+    train_r2 = float(r2_score(y_train, y_train_pred))
+    val_r2 = float(r2_score(y_val, y_val_pred))
+
+    return model, feature_cols, val_rmse, train_r2, val_r2
 
 
 def select_lambda(
@@ -124,12 +130,12 @@ def select_lambda(
 
     print("λ selection:")
     for lam in candidates:
-        model, cols, rmse = fit_response_model(df, lam, alpha=alpha)
+        model, cols, rmse, tr_r2, val_r2 = fit_response_model(df, lam, alpha=alpha)
         tag = ""
         if rmse < best_rmse:
             best_lam, best_rmse, best_model, best_cols = lam, rmse, model, cols
             tag = " <-- best"
-        print(f"  λ={lam:.2f}  val RMSE={rmse:.4f}{tag}")
+        print(f"  λ={lam:.2f}  val RMSE={rmse:.4f}  train R²={tr_r2:.4f}  val R²={val_r2:.4f}{tag}")
 
     # Refit on all data with the best λ
     df = df.copy()
@@ -142,7 +148,12 @@ def select_lambda(
     final_model = Ridge(alpha=alpha)
     final_model.fit(X, y)
 
-    print(f"Selected λ={best_lam:.2f} (val RMSE={best_rmse:.4f}), refitted on all data.\n")
+    # In-sample R² for the final model (fitted on all data)
+    y_pred_all = final_model.predict(X)
+    full_r2 = float(r2_score(y, y_pred_all))
+
+    print(f"Selected λ={best_lam:.2f} (val RMSE={best_rmse:.4f}), refitted on all data.")
+    print(f"Final model in-sample R²={full_r2:.4f}\n")
     return best_lam, final_model, feature_cols
 
 
